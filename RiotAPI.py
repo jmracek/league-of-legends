@@ -1,7 +1,9 @@
 import RiotConstants as Consts
+import ChampStaticData as ChampData
+import tensorflow as tf
+import numpy as np
 import requests
 import pymysql
-import numpy as np
 import json
 import pandas as pd
 import time
@@ -62,7 +64,7 @@ class RiotAPI(object):
 			version=Consts.API_VERSIONS['summoner'],
 			accountId=accountID
 			)
-		return self._request(api_url).json()
+		return self._request(api_url)
 
 	def get_game_ids_by_name(self,name):
 		gameIDs = []
@@ -76,7 +78,7 @@ class RiotAPI(object):
 	def write_summoner_to_db(self,name):
 		#Conect to DB
 		
-		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='YOU WISH', db='league_data')
+		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data')
 		cur = conn.cursor()
 
 		#This stuff was important before I learned about INSERT IGNORE.  I'm keeping it here for future ref.
@@ -222,7 +224,7 @@ class RiotAPI(object):
 			seed = json.load(seed_json)
 	
 			#Open the connection to the mysql server
-			conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='YOU WISH', db='league_data')
+			conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data')
 			cur = conn.cursor()
 
 			#For each match in the database, record the summoner information of the participants, together with the corresponding relevant match information
@@ -264,7 +266,7 @@ class RiotAPI(object):
 		#STEP 1: {
 
 		#Connect to the DB
-		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='YOU WISH', db='league_data', charset='utf8')
+		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
 		cur = conn.cursor()
 
 		#Find the number of summoners in our table, fix a desired number of summoners to select, then figure out the threshhold probability 
@@ -287,8 +289,14 @@ class RiotAPI(object):
 				print('Progress: ' + str(count) + ' records')
 			count+=1
 			accountId = i[0]
-			matchJSON = self.get_summoner_matches_by_id(accountId)
+			match_api_response = self.get_summoner_matches_by_id(accountId)
 			
+			#Go to the next summoner if the match list response code is not 200
+			if match_api_response.status_code != 200:
+				continue
+			else:
+				matchJSON = match_api_response.json()
+
 			#First throw away any matches played before season 6
 			tempM = [x for x in matchJSON['matches'] if x['season'] >= 6]
 
@@ -363,8 +371,7 @@ class RiotAPI(object):
 						#Update the junction table
 						summonerjctmatch_sql = "INSERT IGNORE INTO summonersjctmatches (summonerId, matchId, champId, team, lane, role, tier) VALUES (%s, %s,%s,%s,%s,%s,%s)"
 						participantId = participant['participantId']-1
-						
-						cur.execute(summonerjctmatch_sql, (participant['player']['summonerId'], match['gameId'], match['champion'], gameJSON['participants'][participantId]['teamId'], match['lane'],match['role'], gameJSON['participants'][participantId]['highestAchievedSeasonTier']))
+						cur.execute(summonerjctmatch_sql, (participant['player']['summonerId'], gameJSON['gameId'], gameJSON['participants'][participantId]['championId'], gameJSON['participants'][participantId]['teamId'], gameJSON['participants'][participantId]['timeline']['lane'] , gameJSON['participants'][participantId]['timeline']['role'], gameJSON['participants'][participantId]['highestAchievedSeasonTier']))
 						conn.commit()
 
 				
@@ -382,7 +389,7 @@ class RiotAPI(object):
 	def validate_matches_table(self):
 		offset = 300;
 		#This function goes through the whole matches table and makes sure that all the summoners who played in a match are recorded in summonersjctmatches.  If for some reason (connection error, etc.) a summoner is not recorded, this will fix it.
-		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='YOU WISH', db='league_data', charset='utf8')
+		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
 		cur = conn.cursor()	
 		count_query = 'SELECT count(*) FROM matches'
 		cur.execute(count_query)
@@ -442,12 +449,244 @@ class RiotAPI(object):
 
 
 
-
-#Coming soon!
-
-	#def win_prob_with_objective_by_tier(self,objective,tier):
+	def win_probability_with_objective_by_tier(self,objective):
 	#This function queries our match database to determine what is the probability of winning the game if you get first drag, baron, tower, or blood.
 	#objective is a string with values: 'Dragon', 'Baron', 'Blood', or 'Tower'
-	#tier is a string with values: 'Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond', 'Master', 'Challenger'
+	#We separate the results by tier.  Tier is 'Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond', 'Master', 'Challenger'
 
-	
+		#List of stuff I need to accomplish:
+			#1. Calculate the average tier of the players in a given match
+			#2. From those matches, select those where objective = True.
+
+		tier_dict = {'UNRANKED':None, 'BRONZE':1, 'SILVER':2,'GOLD':3,'PLATINUM':4,'DIAMOND':5,'MASTER':6,'CHALLENGER':7}
+		#Later, we will store results of a computation in here.
+		win_probability_dict = {}
+
+		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
+		cur = conn.cursor()
+
+		cur.execute('SELECT count(*) from matches')
+		num_matches = cur.fetchone()[0]
+
+		df = pd.DataFrame(index = (0,num_matches), columns=('matchId','matchTier',objective,'win') )
+		df_row_counter = 0
+
+		matches_sql = 'SELECT matchId, ' + objective + ', win FROM matches'
+		cur.execute(matches_sql)
+		matchIds = cur.fetchall()
+		match_counter=0
+
+		for m in matchIds:
+			match_counter+=1
+			#include some output to have an idea of progress
+			if match_counter % 100 == 0:
+				print(match_counter)
+
+			matchId = m[0]
+			cur.execute('SELECT tier FROM summonersjctmatches WHERE matchId = ' + str(matchId))
+			tiers = cur.fetchall()
+			
+			#Initialize some variables used for computing the average tier of players in a match
+			counter = 0
+			match_tier=0
+
+			#Find the sum of the tiers of the ranked players in the given match
+			for t in tiers:
+				t2 = t[0]
+				if tier_dict[t2] != None:
+					counter+=1
+					match_tier += tier_dict[t2]
+				else:
+					continue
+
+			#Here is the average tier of the ranked players in the match.  We are going to insist that we know the ranks of at least 3 players in the match. 
+			if counter < 4:
+				continue
+			else:
+				match_tier = match_tier/counter 
+				who_got_objective = m[1]
+				winner = m[2]
+
+				df.loc[df_row_counter] = [matchId, match_tier, who_got_objective, winner]
+				df_row_counter +=1
+
+		#Now we run some statistical analysis on our dataframe.  
+		for tier in tier_dict:
+			#Skip unranked...
+			if tier == 'UNRANKED':
+				continue
+			#Here we select the upper and lower bounds for the tier value of a match.  For example, a gold match has 2.5 < tier < 3.5.
+			lower_bound = tier_dict[tier]-0.5
+			upper_bound = tier_dict[tier]+0.5
+
+
+			#Select those matches played at the specified tier and store the result in a dataframe
+			matches_by_tier_df = df.loc[ (df['matchTier'] < upper_bound) & (df['matchTier'] > lower_bound) ]
+
+			#Total number of matches played at a given tier		
+			matches_by_tier_count = matches_by_tier_df.shape[0]
+			print(matches_by_tier_count)
+			#Total number of matches at a given tier where the objective was taken by team 200 AND team 200 won
+			matches_by_tier_with_obj_and_win_count = matches_by_tier_df.loc[(matches_by_tier_df[objective]==True) & (matches_by_tier_df['win']==True)].shape[0]
+			print(matches_by_tier_with_obj_and_win_count)
+
+			#Probability of taking the objective and winning
+			if matches_by_tier_count == 0:
+				P_obj_and_win = 0
+				continue
+			else:
+				P_obj_and_win = matches_by_tier_with_obj_and_win_count / matches_by_tier_count 
+
+			#Probability of taking the objective is equal to half the probability that the objective gets taken at all
+			P_obj = matches_by_tier_df.loc[ matches_by_tier_df[objective] != None ].shape[0] / matches_by_tier_count / 2
+			#The overall conditional probability that you win, given that you took an objective is given by:
+			P = P_obj_and_win/P_obj
+			win_probability_dict.update({tier:P})
+
+		#Return the probability of winning if team 200 is playing a match at a given tier and takes some objective first:
+		#return 'If your team gets ' + objective + ' then your probability of winning is ' +str(P_obj_and_win/P_obj*100)+'%'
+		plt.bar(range(len(win_probability_dict)), win_probability_dict.values(), align='center')
+		plt.xticks(range(len(win_probability_dict)), win_probability_dict.keys())
+		plt.show()
+
+		return plt
+
+	def find_best_bot_lane_duo(self,champId1,champId2):
+		#INPUTS:
+			#champId1 is a string containing the name of one of the 14 in-meta support champions
+			#champId2 is a string containing the name of one of the 14 in-meta ADC champions
+
+		def get_batch_from_db(batch_size):
+			#This subroutine fetches a list of size batch_size training data, stored as a numpy array of numpy arrays
+
+			#INPUTS: An integer, batch_size, indicating how many data points to return in a batch
+			#OUTPUTS: Numpy Arrays, bx and by, consisting of batch_size entries of training data.  The training data are as follows: 
+
+			#The array bx[j] is a 28x1 np array.  The first 14 entries indicate the support player of the losing team; the next 14 entries indicate the ADC of the losing team.
+			#The array by[j] is 196x1 np array, and represents the collection of ADC/support pairs (ordered lexicographically by support > adc)
+
+			#Initialize the outputs
+			bx = np.array([])
+			by = np.array([])
+
+			#Connect to the database
+			conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
+			cur = conn.cursor()	
+			
+			#Select 100 matches from the db at random
+
+			#I know this query is bad in general when you have a table with a lot of matches, but I currently only have 50k so it isn't too awful.  Please don't hate me
+			#The alternative is to SELECT * FROM matches where rand() < cutoff, with cutoff an appropriately chosen probability so that I would select approximately 100 matches.
+			
+			#Ok... I also only want to select matches where in-meta champs played in the bottom lane.
+
+			#I am stuck here for now.  I need to find a way to query only the games where in-meta champs were played, then select 100 of them at random.
+
+			match_query = 'SELECT matches.matchId, matches.win FROM matches INNER JOIN   ORDER BY rand() limit 100'
+			cur.execute(match_query)
+			match_list = cur.fetchall()
+
+			#Now that I have a list of 100 matchIds, I want to find the ADC and support of the losing team (recalling that win = 1 encodes that team 200 won)
+			for matches in match_list:
+				if matches[1]==0:
+					#in the event team 100 won
+					support_query = 'SELECT champId FROM summonersjctmatches WHERE role=\'DUO_SUPPORT\' AND team = 200 AND matchId =' + str(matches[0])
+					adc_query = 	'SELECT champId FROM summonersjctmatches WHERE role=\'DUO_CARRY\' AND team = 200 AND matchId =' + str(matches[0])
+					cur.execute(bot_lane_query)
+					q = cur.fetchall()
+
+
+
+
+
+
+		#This function inputs your bot lane opponents, and outputs the best possible lane to play against them
+		#The 'best' lane is determined by training a neural network against win/loss data.  We only consider the 14 in meta supports and 14 in meta ADCs.
+
+		#The input to the neural network is an array of length #adc + #support champs.  The elements of the array represent categorical variables that describe the losing team's
+		#champions.  An entry of the input array is 0 if the champ was not part of the losing team, and is equal to 1 if the champ was a part of the losing team.  The output of the
+		#neural network is an array of length 14*14 
+
+		#The neural network is trained on a sample of 50000 games played, chosen at random from the MySQL database in batches of 100.
+
+		#I am using code from: https://github.com/aymericdamien/TensorFlow-Examples/blob/master/examples/3_NeuralNetworks/multilayer_perceptron.py
+		#in order to get myself in a position where I can get familiar with tensorflow.
+
+		def train_lane_nn():
+
+			# Parameters
+			learning_rate = 0.001
+			training_epochs = 15
+			batch_size = 100
+			display_step = 1
+
+			# Network Parameters
+			n_hidden_1 = 100 # 1st layer number of features
+			n_hidden_2 = 100 # 2nd layer number of features
+			n_input = 28 # 14 supports and 14 ADCs from the losing team
+			n_classes = 196 # 14 supports x 14 adcs = 196 possible pairs of ADC/support combos
+
+			# tf Graph input
+			x = tf.placeholder("float", [None, n_input])
+			y = tf.placeholder("float", [None, n_classes])
+
+			# Create model with 2 hidden layers and an output layer
+			def multilayer_perceptron(x, weights, biases):
+	    		# Hidden layer with RELU activation
+	    		layer_1 = tf.add(tf.matmul(x, weights['h1']), biases['b1'])
+	    		layer_1 = tf.nn.relu(layer_1)
+	    		# Hidden layer with RELU activation
+	    		layer_2 = tf.add(tf.matmul(layer_1, weights['h2']), biases['b2'])
+	    		layer_2 = tf.nn.relu(layer_2)
+	    		# Output layer with linear activation.  This has been changed from the sourcecode to add a softmax to the output layer
+	    		out_layer = tf.matmul(layer_2, weights['out']) + biases['out']
+	    		return out_layer
+
+	    	# Store layers weight & bias, randomly initialized.
+			weights = {
+			    'h1': tf.Variable(tf.random_normal([n_input, n_hidden_1])),
+			    'h2': tf.Variable(tf.random_normal([n_hidden_1, n_hidden_2])),
+			    'out': tf.Variable(tf.random_normal([n_hidden_2, n_classes]))
+			}
+			biases = {
+			    'b1': tf.Variable(tf.random_normal([n_hidden_1])),
+			    'b2': tf.Variable(tf.random_normal([n_hidden_2])),
+			    'out': tf.Variable(tf.random_normal([n_classes]))
+			}
+
+			# Define loss and optimizer
+			cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=pred, labels=y))
+			optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost)
+
+			# Initializing the variables
+			init = tf.global_variables_initializer()
+
+			# Launch the graph
+			with tf.Session() as sess:
+			    sess.run(init)
+
+			    # Training cycle
+			    for epoch in range(training_epochs):
+			        avg_cost = 0.
+			        total_batch = int(50000/100) #Number of games, divided by number of matches per training batch
+			        # Loop over all batches
+			        for i in range(total_batch):
+			            batch_x, batch_y = get_batch_from_db(batch_size)
+			            # Run optimization op (backprop) and cost op (to get loss value)
+			            _, c = sess.run([optimizer, cost], feed_dict={x: batch_x,
+			                                                          y: batch_y})
+			            # Compute average loss
+			            avg_cost += c / total_batch
+			        # Display logs per epoch step
+			        if epoch % display_step == 0:
+			            print("Epoch:", '%04d' % (epoch+1), "cost=", \
+			                "{:.9f}".format(avg_cost))
+			    print("Optimization Finished!")
+
+
+		#Continue with the function, now that I have subroutines for fetching batches and training my nn.
+
+		support_dict = {'Zyra':0, 'Bard':1,'Braum':2,'Soraka':3,'Leona':4, 'Janna':5,'Nami':6,'Karma':7,'Lulu':8,'Morgana':9,'Sona':10,'Blitzcrank':11,'Rakan':12,'Thresh':13}
+		adc_dict = {'Caitlyn':0,'Xayah':1,'Lucian':2,'Draven':3,'Jinx':4, 'Vayne':5, 'Twitch':6, 'Ashe':7, 'Ezreal':8,'MissFortune':9,'Jhin':10,'Varus':11,'Tristana':12,'KogMaw':13}
+
+
