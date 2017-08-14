@@ -556,47 +556,68 @@ class RiotAPI(object):
 			#champId1 is a string containing the name of one of the 14 in-meta support champions
 			#champId2 is a string containing the name of one of the 14 in-meta ADC champions
 
-		def get_batch_from_db(batch_size):
-			#This subroutine fetches a list of size batch_size training data, stored as a numpy array of numpy arrays
+		#These dictionaries associate champ names to the categorical positions they indicate in the training data
+		support_dict = {'Zyra':0, 'Bard':1,'Braum':2,'Soraka':3,'Leona':4, 'Janna':5,'Nami':6,'Karma':7,'Lulu':8,'Morgana':9,'Sona':10,'Blitzcrank':11,'Rakan':12,'Thresh':13}
+		inverted_support_dict = {value:key for key,value in support_dict.items()}
+		adc_dict = {'Caitlyn':0,'Xayah':1,'Lucian':2,'Draven':3,'Jinx':4, 'Vayne':5, 'Twitch':6, 'Ashe':7, 'Ezreal':8,'MissFortune':9,'Jhin':10,'Varus':11,'Tristana':12,'KogMaw':13}
+		inverted_adc_dict = {value:key for key,value in adc_dict.items()}
 
-			#INPUTS: An integer, batch_size, indicating how many data points to return in a batch
-			#OUTPUTS: Numpy Arrays, bx and by, consisting of batch_size entries of training data.  The training data are as follows: 
+		product_dict = {support_champ: {adc_champ: adc_dict[adc_champ]+ 14*support_dict[support_champ] for adc_champ in adc_dict} for support_champ in support_dict}
+		inverted_product_dict = {i: (inverted_adc_dict[i%14],inverted_support_dict[int(i/14)]) for i in range(14*14)}
+
+		
+		conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
+		cur = conn.cursor()	
+		cur.execute('SELECT * FROM meta_champs')
+
+		#This dictionary associates champ names to their champIds
+		meta_champs = {champ[0]:champ[1] for champ in cur.fetchall()}
+
+		def get_data_from_db():
+
+			#INPUTS: None
+			#OUTPUTS: Numpy Arrays, bx and by, consisting of all training data.  The training data are as follows: 
 
 			#The array bx[j] is a 28x1 np array.  The first 14 entries indicate the support player of the losing team; the next 14 entries indicate the ADC of the losing team.
 			#The array by[j] is 196x1 np array, and represents the collection of ADC/support pairs (ordered lexicographically by support > adc)
-
-			#Initialize the outputs
-			bx = np.array([])
-			by = np.array([])
 
 			#Connect to the database
 			conn = pymysql.connect(host='127.0.0.1', user='jmracek', passwd='', db='league_data', charset='utf8')
 			cur = conn.cursor()	
 			
-			#Select 100 matches from the db at random
+			#SELECT all the matches in the DB such that all 4 champs in the bottom lane are in-meta.  Separate these by winners and losers.
+			support_winners_query = "SELECT T.matchId, T.champId FROM (SELECT * FROM summonersjctmatches WHERE lane = \'BOTTOM\' AND matchId IN (SELECT matchId FROM summonersjctmatches WHERE lane=\'BOTTOM\' AND CASE WHEN role=\'DUO_SUPPORT\' THEN champId IN (SELECT champId FROM meta_supports) WHEN role=\'DUO_CARRY\' THEN champId IN (SELECT champId FROM meta_adc) END GROUP BY matchId HAVING count(*) = 4)) AS T LEFT JOIN matches ON T.matchId = matches.matchId WHERE T.team = CASE WHEN matches.win = 1 THEN 200 ELSE 100 END AND T.role=\'DUO_SUPPORT\' ORDER BY matchId;"
+			support_losers_query = "SELECT T.matchId, T.champId FROM (SELECT * FROM summonersjctmatches WHERE lane = \'BOTTOM\' AND matchId IN (SELECT matchId FROM summonersjctmatches WHERE lane=\'BOTTOM\' AND CASE WHEN role=\'DUO_SUPPORT\' THEN champId IN (SELECT champId FROM meta_supports) WHEN role=\'DUO_CARRY\' THEN champId IN (SELECT champId FROM meta_adc) END GROUP BY matchId HAVING count(*) = 4)) AS T LEFT JOIN matches ON T.matchId = matches.matchId WHERE T.team = CASE WHEN matches.win = 1 THEN 100 ELSE 200 END AND T.role=\'DUO_SUPPORT\' ORDER BY matchId;"
 
-			#I know this query is bad in general when you have a table with a lot of matches, but I currently only have 50k so it isn't too awful.  Please don't hate me
-			#The alternative is to SELECT * FROM matches where rand() < cutoff, with cutoff an appropriately chosen probability so that I would select approximately 100 matches.
+			adc_winners_query = "SELECT T.matchId, T.champId FROM (SELECT * FROM summonersjctmatches WHERE lane = \'BOTTOM\' AND matchId IN (SELECT matchId FROM summonersjctmatches WHERE lane=\'BOTTOM\' AND CASE WHEN role=\'DUO_SUPPORT\' THEN champId IN (SELECT champId FROM meta_supports) WHEN role=\'DUO_CARRY\' THEN champId IN (SELECT champId FROM meta_adc) END GROUP BY matchId HAVING count(*) = 4)) AS T LEFT JOIN matches ON T.matchId = matches.matchId WHERE T.team = CASE WHEN matches.win = 1 THEN 200 ELSE 100 END AND T.role=\'DUO_CARRY\' ORDER BY matchId;"
+			adc_losers_query = "SELECT T.matchId, T.champId FROM (SELECT * FROM summonersjctmatches WHERE lane = \'BOTTOM\' AND matchId IN (SELECT matchId FROM summonersjctmatches WHERE lane=\'BOTTOM\' AND CASE WHEN role=\'DUO_SUPPORT\' THEN champId IN (SELECT champId FROM meta_supports) WHEN role=\'DUO_CARRY\' THEN champId IN (SELECT champId FROM meta_adc) END GROUP BY matchId HAVING count(*) = 4)) AS T LEFT JOIN matches ON T.matchId = matches.matchId WHERE T.team = CASE WHEN matches.win = 1 THEN 100 ELSE 200 END AND T.role=\'DUO_CARRY\' ORDER BY matchId;"
+
+			cur.execute(support_winners_query)
+			winning_support_list = np.array(cur.fetchall())
+			cur.execute(support_losers_query)
+			losing_support_list = np.array(cur.fetchall())
+			cur.execute(adc_winners_query)
+			winning_carry_list = np.array(cur.fetchall())
+			cur.execute(adc_losers_query)
+			losing_carry_list = np.array(cur.fetchall())
+
+			bx = np.zeros( (int(len(losing_support_list)), 28) )
+			by = np.zeros( (int(len(winning_support_list)), 196) )
+			index = 0
 			
-			#Ok... I also only want to select matches where in-meta champs played in the bottom lane.
+			for sup_win, sup_lose, adc_win, adc_lose in zip(winning_support_list, losing_support_list, winning_carry_list, losing_carry_list):
 
-			#I am stuck here for now.  I need to find a way to query only the games where in-meta champs were played, then select 100 of them at random.
+				#Record the losing support and adc
+				bx[index][support_dict[meta_champs[sup_lose[1]]]] = 1
+				bx[index][14+adc_dict[meta_champs[adc_lose[1]]]] = 1
 
-			match_query = 'SELECT matches.matchId, matches.win FROM matches INNER JOIN   ORDER BY rand() limit 100'
-			cur.execute(match_query)
-			match_list = cur.fetchall()
+				#Record the winning support and adc
+				by[index][product_dict[meta_champs[sup_win[1]]][meta_champs[adc_win[1]]]] = 1
 
-			#Now that I have a list of 100 matchIds, I want to find the ADC and support of the losing team (recalling that win = 1 encodes that team 200 won)
-			for matches in match_list:
-				if matches[1]==0:
-					#in the event team 100 won
-					support_query = 'SELECT champId FROM summonersjctmatches WHERE role=\'DUO_SUPPORT\' AND team = 200 AND matchId =' + str(matches[0])
-					adc_query = 	'SELECT champId FROM summonersjctmatches WHERE role=\'DUO_CARRY\' AND team = 200 AND matchId =' + str(matches[0])
-					cur.execute(bot_lane_query)
-					q = cur.fetchall()
+				#Count
+				index += 1
 
-
-
+			return bx, by
 
 
 
@@ -607,7 +628,7 @@ class RiotAPI(object):
 		#champions.  An entry of the input array is 0 if the champ was not part of the losing team, and is equal to 1 if the champ was a part of the losing team.  The output of the
 		#neural network is an array of length 14*14 
 
-		#The neural network is trained on a sample of 50000 games played, chosen at random from the MySQL database in batches of 100.
+		#The neural network is trained on a sample of about 20000 games played
 
 		#I am using code from: https://github.com/aymericdamien/TensorFlow-Examples/blob/master/examples/3_NeuralNetworks/multilayer_perceptron.py
 		#in order to get myself in a position where I can get familiar with tensorflow.
@@ -633,15 +654,14 @@ class RiotAPI(object):
 			# Create model with 2 hidden layers and an output layer
 			def multilayer_perceptron(x, weights, biases):
 	    		# Hidden layer with RELU activation
-	    		layer_1 = tf.add(tf.matmul(x, weights['h1']), biases['b1'])
-	    		layer_1 = tf.nn.relu(layer_1)
-	    		# Hidden layer with RELU activation
-	    		layer_2 = tf.add(tf.matmul(layer_1, weights['h2']), biases['b2'])
-	    		layer_2 = tf.nn.relu(layer_2)
-	    		# Output layer with linear activation.  This has been changed from the sourcecode to add a softmax to the output layer
-	    		out_layer = tf.matmul(layer_2, weights['out']) + biases['out']
-	    		return out_layer
-
+				layer_1 = tf.add(tf.matmul(x, weights['h1']), biases['b1'])
+				layer_1 = tf.nn.relu(layer_1)
+				# Hidden layer with RELU activation
+				layer_2 = tf.add(tf.matmul(layer_1, weights['h2']), biases['b2'])
+				layer_2 = tf.nn.relu(layer_2)
+				# Output layer with linear activation.  This has been changed from the sourcecode to add a softmax to the output layer
+				out_layer = tf.matmul(layer_2, weights['out']) + biases['out']
+				return out_layer
 	    	# Store layers weight & bias, randomly initialized.
 			weights = {
 			    'h1': tf.Variable(tf.random_normal([n_input, n_hidden_1])),
@@ -654,6 +674,9 @@ class RiotAPI(object):
 			    'out': tf.Variable(tf.random_normal([n_classes]))
 			}
 
+			# Construct model
+			pred = multilayer_perceptron(x, weights, biases)
+
 			# Define loss and optimizer
 			cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=pred, labels=y))
 			optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost)
@@ -663,30 +686,46 @@ class RiotAPI(object):
 
 			# Launch the graph
 			with tf.Session() as sess:
-			    sess.run(init)
+				sess.run(init)
+				data, labels = get_data_from_db()
+
+				training_data = data[:int(0.8*len(data))]
+				training_labels = labels[:int(0.8*len(labels))]
+
+				testing_data = data[int(0.8*len(data)):]
+				testing_labels = labels[int(0.8*len(labels)):]
 
 			    # Training cycle
-			    for epoch in range(training_epochs):
-			        avg_cost = 0.
-			        total_batch = int(50000/100) #Number of games, divided by number of matches per training batch
+				for epoch in range(training_epochs):
+					avg_cost = 0.
+					total_batch = int(len(training_data)/100) #Number of games, divided by number of matches per training batch
+
+			        #Randomize the data
+					np.random.shuffle(training_data)
+
 			        # Loop over all batches
-			        for i in range(total_batch):
-			            batch_x, batch_y = get_batch_from_db(batch_size)
-			            # Run optimization op (backprop) and cost op (to get loss value)
-			            _, c = sess.run([optimizer, cost], feed_dict={x: batch_x,
-			                                                          y: batch_y})
-			            # Compute average loss
-			            avg_cost += c / total_batch
-			        # Display logs per epoch step
-			        if epoch % display_step == 0:
-			            print("Epoch:", '%04d' % (epoch+1), "cost=", \
-			                "{:.9f}".format(avg_cost))
-			    print("Optimization Finished!")
+					for i in range(total_batch):
+						batch_x, batch_y = training_data[i*100:(i+1)*100], training_labels[i*100:(i+1)*100]
+						# Run optimization op (backprop) and cost op (to get loss value)
+						_, c = sess.run([optimizer, cost], feed_dict={x: batch_x, y: batch_y})
+						# Compute average loss
+						avg_cost += c / total_batch
+					# Display logs per epoch step
+					if epoch % display_step == 0:
+						print("Epoch:", '%04d' % (epoch+1), "cost=", \
+							"{:.9f}".format(avg_cost))
+				print("Optimization Finished!")
 
+				# Test model
+				correct_prediction = tf.equal(tf.argmax(pred, 1), tf.argmax(y, 1))
+				# Calculate accuracy
+				#accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
+				#print("Accuracy:", accuracy.eval({x: testing_data, y: testing_labels}))
 
-		#Continue with the function, now that I have subroutines for fetching batches and training my nn.
+				prediction = tf.argmax(pred,1)
+				out = prediction.eval({x: np.array([1 if i in set([support_dict[champId1], adc_dict[champId2]+14]) else 0 for i in range(28)]).reshape( (1,28) ) })
+				print('The best lane against ' + champId1 + ' and ' + champId2 + ' is:' )
+				print(inverted_product_dict[out[0]])
+				#print('The best lane against ' + champId1 + ' and ' + champId2 + ' is '#)
 
-		support_dict = {'Zyra':0, 'Bard':1,'Braum':2,'Soraka':3,'Leona':4, 'Janna':5,'Nami':6,'Karma':7,'Lulu':8,'Morgana':9,'Sona':10,'Blitzcrank':11,'Rakan':12,'Thresh':13}
-		adc_dict = {'Caitlyn':0,'Xayah':1,'Lucian':2,'Draven':3,'Jinx':4, 'Vayne':5, 'Twitch':6, 'Ashe':7, 'Ezreal':8,'MissFortune':9,'Jhin':10,'Varus':11,'Tristana':12,'KogMaw':13}
-
-
+		train_lane_nn()
